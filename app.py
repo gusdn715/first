@@ -154,13 +154,40 @@ if "missiles" not in st.session_state:
 if "defense_assets" not in st.session_state:
     st.session_state.defense_assets: list[dict] = []
 
-if "prob_matrix" not in st.session_state:
-    # 초기 예시 방어 자산 행 포함
-    st.session_state.prob_matrix = pd.DataFrame(
-        {mt: [50.0, 70.0, 60.0] for mt in DEFAULT_MISSILE_TYPES},
-        index=["패트리엇 PAC-3 (예시)", "THAAD (예시)", "천궁-II (예시)"],
-        dtype=float,
-    )
+# {(row_name, col_name): 요격확률(float)} — DataFrame 대신 dict로 관리하여 구조 변경과 무관하게 값 유지
+if "intercept_probs" not in st.session_state:
+    st.session_state.intercept_probs: dict = {}
+
+
+def _unique_label(label: str, existing: list[str]) -> str:
+    """중복 이름에 #2, #3 접미사를 붙여 고유한 레이블 반환"""
+    if label not in existing:
+        return label
+    count = sum(1 for e in existing if e == label or e.startswith(label + " #"))
+    return f"{label} #{count + 1}"
+
+
+def build_prob_matrix() -> pd.DataFrame:
+    """현재 defense_assets(행) × missiles(열) 기반으로 매트릭스를 매 렌더마다 새로 생성"""
+    rows = [a["row_name"] for a in st.session_state.defense_assets]
+    cols = [m["col_name"] for m in st.session_state.missiles]
+    if not rows or not cols:
+        return pd.DataFrame()
+    data = {
+        col: [
+            st.session_state.intercept_probs.get((row, col), 50.0)
+            for row in rows
+        ]
+        for col in cols
+    }
+    return pd.DataFrame(data, index=rows, dtype=float)
+
+
+def save_prob_matrix(df: pd.DataFrame) -> None:
+    """data_editor 결과를 intercept_probs dict에 저장"""
+    for row in df.index:
+        for col in df.columns:
+            st.session_state.intercept_probs[(row, col)] = float(df.loc[row, col])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -200,11 +227,14 @@ with st.sidebar:
                     f"위도 {KP_LAT_MIN}–{KP_LAT_MAX}° / 경도 {KP_LON_MIN}–{KP_LON_MAX}° 내에서 입력하세요."
                 )
             else:
+                existing_col_names = [m["col_name"] for m in st.session_state.missiles]
+                col_label = _unique_label(m_name, existing_col_names)
                 st.session_state.missiles.append(
-                    dict(name=m_name, lat=m_lat, lon=m_lon,
-                         range_km=m_range, threat=m_threat)
+                    dict(name=m_name, col_name=col_label,
+                         lat=m_lat, lon=m_lon, range_km=m_range, threat=m_threat)
                 )
                 st.success(f"✅ '{m_name}' 추가 완료!")
+                st.rerun()
 
         # 등록된 미사일 목록
         if st.session_state.missiles:
@@ -222,7 +252,12 @@ with st.sidebar:
                     )
                 with cb:
                     if st.button("✕", key=f"del_m_{i}", help="삭제"):
-                        st.session_state.missiles.pop(i)
+                        removed_m = st.session_state.missiles.pop(i)
+                        dead_col = removed_m["col_name"]
+                        st.session_state.intercept_probs = {
+                            k: v for k, v in st.session_state.intercept_probs.items()
+                            if k[1] != dead_col
+                        }
                         st.rerun()
 
     # ── 탭 2 : 아군 방어 자산 ─────────────────────────────────
@@ -254,22 +289,15 @@ with st.sidebar:
                     f"위도 {KP_LAT_MIN}–{KP_LAT_MAX}° / 경도 {KP_LON_MIN}–{KP_LON_MAX}° 내에서 입력하세요."
                 )
             else:
+                existing_row_names = [a["row_name"] for a in st.session_state.defense_assets]
+                row_label = _unique_label(d_name, existing_row_names)
                 st.session_state.defense_assets.append(
-                    dict(name=d_name, lat=d_lat, lon=d_lon,
-                         intercept_km=d_intercept, radar_km=d_radar_rng,
-                         azimuth=d_azimuth, angle=d_angle)
-                )
-                # 요격 확률 매트릭스에 새 행 추가
-                new_row = pd.DataFrame(
-                    [[50.0] * len(DEFAULT_MISSILE_TYPES)],
-                    columns=DEFAULT_MISSILE_TYPES,
-                    index=[d_name],
-                    dtype=float,
-                )
-                st.session_state.prob_matrix = pd.concat(
-                    [st.session_state.prob_matrix, new_row]
+                    dict(name=d_name, row_name=row_label,
+                         lat=d_lat, lon=d_lon, intercept_km=d_intercept,
+                         radar_km=d_radar_rng, azimuth=d_azimuth, angle=d_angle)
                 )
                 st.success(f"✅ '{d_name}' 추가 완료!")
+                st.rerun()
 
         # 등록된 방어 자산 목록
         if st.session_state.defense_assets:
@@ -287,10 +315,11 @@ with st.sidebar:
                 with cb:
                     if st.button("✕", key=f"del_d_{i}", help="삭제"):
                         removed = st.session_state.defense_assets.pop(i)
-                        if removed["name"] in st.session_state.prob_matrix.index:
-                            st.session_state.prob_matrix = st.session_state.prob_matrix.drop(
-                                removed["name"]
-                            )
+                        dead_row = removed["row_name"]
+                        st.session_state.intercept_probs = {
+                            k: v for k, v in st.session_state.intercept_probs.items()
+                            if k[0] != dead_row
+                        }
                         st.rerun()
 
 
@@ -473,38 +502,40 @@ st.caption(
     "셀을 직접 클릭하여 요격 성공 확률(%)을 수정할 수 있습니다."
 )
 
-# 컬럼 설정 (0~100 % 범위 제한, 소수점 1자리)
-col_config = {
-    col: st.column_config.NumberColumn(
-        label=col,
-        min_value=0.0,
-        max_value=100.0,
-        step=0.5,
-        format="%.1f%%",
+# 매 렌더마다 현재 missiles(열) × defense_assets(행)으로 매트릭스를 새로 구성
+current_matrix = build_prob_matrix()
+
+if current_matrix.empty:
+    if not st.session_state.defense_assets and not st.session_state.missiles:
+        st.info("사이드바에서 아군 방어 자산과 적 미사일을 추가하면 매트릭스가 자동으로 생성됩니다.")
+    elif not st.session_state.missiles:
+        st.info("사이드바에서 적 미사일을 추가하면 열(컬럼)이 생성됩니다.")
+    else:
+        st.info("사이드바에서 아군 방어 자산을 추가하면 행이 생성됩니다.")
+else:
+    col_config = {
+        col: st.column_config.NumberColumn(
+            label=col,
+            min_value=0.0,
+            max_value=100.0,
+            step=0.5,
+            format="%.1f%%",
+        )
+        for col in current_matrix.columns
+    }
+
+    edited_df = st.data_editor(
+        current_matrix,
+        column_config=col_config,
+        use_container_width=True,
+        num_rows="fixed",
+        key="prob_editor",
     )
-    for col in DEFAULT_MISSILE_TYPES
-}
 
-edited_df = st.data_editor(
-    st.session_state.prob_matrix,
-    column_config=col_config,
-    use_container_width=True,
-    num_rows="fixed",          # 행 추가/삭제는 사이드바에서 관리
-    key="prob_editor",
-)
+    # 편집된 값을 intercept_probs dict에 저장 (구조와 분리된 값 보존)
+    save_prob_matrix(edited_df)
 
-# 변경된 데이터를 세션 상태에 반영
-st.session_state.prob_matrix = edited_df
-
-# 요약 통계 (행별 평균 요격 확률)
-if not edited_df.empty:
     st.markdown("#### 자산별 평균 요격 확률")
-    avg_series = edited_df.mean(axis=1).rename("평균 요격 확률 (%)")
-    avg_df = avg_series.reset_index()
-    avg_df.columns = ["방어 자산", "평균 요격 확률 (%)"]
-    avg_df["평균 요격 확률 (%)"] = avg_df["평균 요격 확률 (%)"].map(lambda x: f"{x:.1f}%")
-
-    # 색상 강조를 위해 수평 바 차트로 표시
     bar_data = edited_df.mean(axis=1)
     st.bar_chart(bar_data, use_container_width=True, height=220)
 
