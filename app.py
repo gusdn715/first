@@ -28,13 +28,6 @@ KP_LAT_MIN, KP_LAT_MAX = 33.0, 43.0
 KP_LON_MIN, KP_LON_MAX = 124.0, 131.0
 KP_CENTER = [38.5, 127.5]
 
-# 기본 미사일 종류 (요격 확률 매트릭스 열 헤더용)
-DEFAULT_MISSILE_TYPES = [
-    "단거리 탄도미사일 (SRBM)",
-    "중거리 탄도미사일 (MRBM)",
-    "순항미사일 (CM)",
-    "극초음속 미사일 (HGV)",
-]
 
 # ═══════════════════════════════════════════════════════════════
 # 유틸리티 함수
@@ -145,6 +138,39 @@ def generate_radar_sector(
     return coords
 
 
+def sync_prob_matrix():
+    """
+    현재 missiles / defense_assets 목록에 맞게 요격 확률 매트릭스를 동기화.
+    - 행(Row)  : 아군 방어 자산 이름
+    - 열(Col)  : 적 미사일 이름
+    - 기존 셀 값은 최대한 유지, 신규 행·열은 기본값 50.0으로 초기화
+    - 삭제된 행·열은 자동 제거
+    """
+    defense_names = [d["name"] for d in st.session_state.defense_assets]
+    missile_names  = [m["name"] for m in st.session_state.missiles]
+    old = st.session_state.prob_matrix
+
+    if not defense_names or not missile_names:
+        st.session_state.prob_matrix = pd.DataFrame(
+            index=pd.Index(defense_names, name="방어 자산"),
+            columns=missile_names,
+            dtype=float,
+        )
+        return
+
+    new_data = {
+        col: [
+            old.loc[row, col]
+            if (not old.empty and row in old.index and col in old.columns)
+            else 50.0
+            for row in defense_names
+        ]
+        for col in missile_names
+    }
+    df = pd.DataFrame(new_data, index=pd.Index(defense_names, name="방어 자산"), dtype=float)
+    st.session_state.prob_matrix = df
+
+
 # ═══════════════════════════════════════════════════════════════
 # 세션 상태 초기화
 # ═══════════════════════════════════════════════════════════════
@@ -155,12 +181,7 @@ if "defense_assets" not in st.session_state:
     st.session_state.defense_assets: list[dict] = []
 
 if "prob_matrix" not in st.session_state:
-    # 초기 예시 방어 자산 행 포함
-    st.session_state.prob_matrix = pd.DataFrame(
-        {mt: [50.0, 70.0, 60.0] for mt in DEFAULT_MISSILE_TYPES},
-        index=["패트리엇 PAC-3 (예시)", "THAAD (예시)", "천궁-II (예시)"],
-        dtype=float,
-    )
+    st.session_state.prob_matrix = pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -259,16 +280,6 @@ with st.sidebar:
                          intercept_km=d_intercept, radar_km=d_radar_rng,
                          azimuth=d_azimuth, angle=d_angle)
                 )
-                # 요격 확률 매트릭스에 새 행 추가
-                new_row = pd.DataFrame(
-                    [[50.0] * len(DEFAULT_MISSILE_TYPES)],
-                    columns=DEFAULT_MISSILE_TYPES,
-                    index=[d_name],
-                    dtype=float,
-                )
-                st.session_state.prob_matrix = pd.concat(
-                    [st.session_state.prob_matrix, new_row]
-                )
                 st.success(f"✅ '{d_name}' 추가 완료!")
 
         # 등록된 방어 자산 목록
@@ -286,11 +297,7 @@ with st.sidebar:
                     )
                 with cb:
                     if st.button("✕", key=f"del_d_{i}", help="삭제"):
-                        removed = st.session_state.defense_assets.pop(i)
-                        if removed["name"] in st.session_state.prob_matrix.index:
-                            st.session_state.prob_matrix = st.session_state.prob_matrix.drop(
-                                removed["name"]
-                            )
+                        st.session_state.defense_assets.pop(i)
                         st.rerun()
 
 
@@ -469,44 +476,45 @@ st_folium(fmap, use_container_width=True, height=600, returned_objects=[])
 st.divider()
 st.subheader("📊 교전 요격 확률 매트릭스 (%)")
 st.caption(
-    "행: 아군 방어 자산  |  열: 적 미사일 종류  |  "
-    "셀을 직접 클릭하여 요격 성공 확률(%)을 수정할 수 있습니다."
+    "행: 아군 방어 자산  |  열: 적 미사일  |  "
+    "사이드바에서 자산·미사일을 추가하면 자동으로 행·열이 생성됩니다."
 )
 
-# 컬럼 설정 (0~100 % 범위 제한, 소수점 1자리)
-col_config = {
-    col: st.column_config.NumberColumn(
-        label=col,
-        min_value=0.0,
-        max_value=100.0,
-        step=0.5,
-        format="%.1f%%",
+# 렌더링 직전에 항상 현재 자산 목록과 동기화
+sync_prob_matrix()
+
+if st.session_state.prob_matrix.empty:
+    st.info("사이드바에서 아군 방어 자산과 적 미사일을 각각 1개 이상 추가하면 매트릭스가 표시됩니다.")
+else:
+    missile_names = [m["name"] for m in st.session_state.missiles]
+
+    # 열(미사일)마다 0~100 % 범위·포맷 설정
+    col_config = {
+        col: st.column_config.NumberColumn(
+            label=col,
+            min_value=0.0,
+            max_value=100.0,
+            step=0.5,
+            format="%.1f%%",
+        )
+        for col in missile_names
+    }
+
+    edited_df = st.data_editor(
+        st.session_state.prob_matrix,
+        column_config=col_config,
+        use_container_width=True,
+        num_rows="fixed",   # 행 추가/삭제는 사이드바에서 관리
+        key="prob_editor",
     )
-    for col in DEFAULT_MISSILE_TYPES
-}
 
-edited_df = st.data_editor(
-    st.session_state.prob_matrix,
-    column_config=col_config,
-    use_container_width=True,
-    num_rows="fixed",          # 행 추가/삭제는 사이드바에서 관리
-    key="prob_editor",
-)
+    # 사용자가 셀을 수정한 값을 세션 상태에 반영
+    st.session_state.prob_matrix = edited_df
 
-# 변경된 데이터를 세션 상태에 반영
-st.session_state.prob_matrix = edited_df
-
-# 요약 통계 (행별 평균 요격 확률)
-if not edited_df.empty:
-    st.markdown("#### 자산별 평균 요격 확률")
-    avg_series = edited_df.mean(axis=1).rename("평균 요격 확률 (%)")
-    avg_df = avg_series.reset_index()
-    avg_df.columns = ["방어 자산", "평균 요격 확률 (%)"]
-    avg_df["평균 요격 확률 (%)"] = avg_df["평균 요격 확률 (%)"].map(lambda x: f"{x:.1f}%")
-
-    # 색상 강조를 위해 수평 바 차트로 표시
-    bar_data = edited_df.mean(axis=1)
-    st.bar_chart(bar_data, use_container_width=True, height=220)
+    # 자산별 평균 요격 확률 바 차트
+    if not edited_df.empty:
+        st.markdown("#### 자산별 평균 요격 확률")
+        st.bar_chart(edited_df.mean(axis=1), use_container_width=True, height=220)
 
 
 # ═══════════════════════════════════════════════════════════════
